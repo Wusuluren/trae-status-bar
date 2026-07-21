@@ -55,7 +55,10 @@ class TraeLogMonitor {
     private var watchers: [FileWatcher] = []
     private var streamStates: [String: Bool] = [:] // path: isRunning
     private let logsBase: String
+    private var currentSessionPath: String?
+    private var baseDirWatcher: DispatchSourceFileSystemObject?
     private var sessionDirWatcher: DispatchSourceFileSystemObject?
+    private var rescanTimer: Timer?
     var onAnyStart: (() -> Void)?
     var onAllStop: (() -> Void)?
     var activeCount: Int { streamStates.values.filter { $0 }.count }
@@ -65,27 +68,44 @@ class TraeLogMonitor {
     }
 
     func start() {
-        watchSession()
-        watchLogsDirectory()
+        scanAndWatch()
+        watchBaseDir()
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.scanAndWatch()
+        }
     }
 
-    // MARK: - 监听当前 session 下所有 window 的 renderer.log
-    private func watchSession() {
-        // 停止旧的 watchers
-        watchers.forEach { $0.onNewLines = nil }
-        watchers.removeAll()
-
+    private func scanAndWatch() {
         guard let sessionDir = findLatestSession() else {
-            print("[trae-status-bar] No renderer.log found")
+            print("[trae-status-bar] No session found")
             return
         }
-
         let sessionPath = "\(logsBase)/\(sessionDir)"
+
+        if sessionPath != currentSessionPath {
+            print("[trae-status-bar] Session changed: \(sessionDir)")
+            currentSessionPath = sessionPath
+            watchers.forEach { $0.onNewLines = nil }
+            watchers.removeAll()
+            streamStates.removeAll()
+            watchSessionDir(sessionPath)
+        }
+
+        refreshWindows(in: sessionPath)
+    }
+
+    private func refreshWindows(in sessionPath: String) {
         guard let windows = try? FileManager.default.contentsOfDirectory(atPath: sessionPath)
             .filter({ $0.hasPrefix("window") }) else { return }
 
+        let watchedPaths = Set(streamStates.keys)
+        var currentPaths = Set<String>()
+
         for window in windows {
             let logPath = "\(sessionPath)/\(window)/renderer.log"
+            currentPaths.insert(logPath)
+
+            if watchedPaths.contains(logPath) { continue }
             guard FileManager.default.fileExists(atPath: logPath) else { continue }
 
             streamStates[logPath] = false
@@ -97,24 +117,20 @@ class TraeLogMonitor {
             watchers.append(w)
             print("[trae-status-bar] Watching: \(logPath)")
         }
+
+        let removed = watchedPaths.subtracting(currentPaths)
+        if !removed.isEmpty {
+            for path in removed {
+                streamStates.removeValue(forKey: path)
+            }
+            watchers = watchers.filter { streamStates.keys.contains($0.path) }
+            print("[trae-status-bar] Removed: \(removed)")
+        }
     }
 
     private func parseLines(_ content: String, from path: String) {
         var started = false
         var stopped = false
-
-        // debug: 每次读到的内容写入 /tmp 文件
-        if let debugHandle = FileHandle(forWritingAtPath: "/tmp/trae_debug.log") {
-            debugHandle.seekToEndOfFile()
-            let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-            let preview = String(content.prefix(500))
-            debugHandle.write("[\(ts)] read \(content.count) bytes from \(path)\n".data(using: .utf8)!)
-            debugHandle.write("[\(ts)] preview: \(preview)\n---\n".data(using: .utf8)!)
-            debugHandle.closeFile()
-        } else {
-            // try create
-            try? content.write(toFile: "/tmp/trae_debug.log", atomically: false, encoding: .utf8)
-        }
 
         content.enumerateLines { line, _ in
             if line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") {
@@ -132,7 +148,6 @@ class TraeLogMonitor {
         }
         if stopped {
             streamStates[path] = false
-            // 所有窗口都 idle 了才触发 onAllStop
             let anyRunning = streamStates.values.contains(true)
             if !anyRunning {
                 DispatchQueue.main.async { [weak self] in
@@ -142,39 +157,65 @@ class TraeLogMonitor {
         }
     }
 
-    // MARK: - 监控 logs 目录，新 session 出现时自动切换
-    private func watchLogsDirectory() {
+    private func watchBaseDir() {
         guard let handle = FileHandle(forReadingAtPath: logsBase) else { return }
         let fd = handle.fileDescriptor
 
         let dispatchSource = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
-            eventMask: [.write, .rename, .delete],
+            eventMask: [.write, .rename, .delete, .extend],
             queue: .main
         )
         dispatchSource.setEventHandler { [weak self] in
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                self?.watchSession()
+                self?.scanAndWatch()
+            }
+        }
+        dispatchSource.resume()
+        self.baseDirWatcher = dispatchSource
+    }
+
+    private func watchSessionDir(_ path: String) {
+        sessionDirWatcher?.cancel()
+        guard let handle = FileHandle(forReadingAtPath: path) else { return }
+        let fd = handle.fileDescriptor
+
+        let dispatchSource = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .rename, .delete, .extend],
+            queue: .main
+        )
+        dispatchSource.setEventHandler { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                guard let self = self, let sp = self.currentSessionPath else { return }
+                self.refreshWindows(in: sp)
             }
         }
         dispatchSource.resume()
         self.sessionDirWatcher = dispatchSource
+        print("[trae-status-bar] Watching session dir: \(path)")
     }
+
+    private static let sessionPattern = try! NSRegularExpression(pattern: #"^\d{8}T\d{6}$"#)
 
     private func findLatestSession() -> String? {
         guard let contents = try? FileManager.default.contentsOfDirectory(atPath: logsBase) else { return nil }
-        let sessions = contents.filter { $0.hasPrefix("2026") || $0.hasPrefix("2025") }.sorted(by: >)
+        let sessions = contents.filter {
+            Self.sessionPattern.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil
+        }.sorted(by: >)
         for session in sessions {
-            let testPath = "\(logsBase)/\(session)/window1/renderer.log"
-            if FileManager.default.fileExists(atPath: testPath) {
-                return session
-            }
+            let sessionPath = "\(logsBase)/\(session)"
+            guard let items = try? FileManager.default.contentsOfDirectory(atPath: sessionPath) else { continue }
+            let hasWindow = items.contains { $0.hasPrefix("window") }
+            if hasWindow { return session }
         }
         return nil
     }
 
     deinit {
+        baseDirWatcher?.cancel()
         sessionDirWatcher?.cancel()
+        rescanTimer?.invalidate()
     }
 }
 
