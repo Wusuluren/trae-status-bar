@@ -59,6 +59,11 @@ class TraeLogMonitor {
     private var baseDirWatcher: DispatchSourceFileSystemObject?
     private var sessionDirWatcher: DispatchSourceFileSystemObject?
     private var rescanTimer: Timer?
+    private var pendingStopTimer: Timer?
+    private let stopGracePeriod: TimeInterval = 3.0
+    private var lastActivityTime: Date = Date()
+    private var safetyTimer: Timer?
+    private let safetyTimeout: TimeInterval = 30
     var onAnyStart: (() -> Void)?
     var onAllStop: (() -> Void)?
     var activeCount: Int { streamStates.values.filter { $0 }.count }
@@ -129,25 +134,27 @@ class TraeLogMonitor {
     }
 
     private func parseLines(_ content: String, from path: String) {
-        var started = false
-        var stopped = false
-
+        var currentState = streamStates[path] ?? false
+        
         content.enumerateLines { line, _ in
-            if line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") || line.contains("sendChatMessageStart") || line.contains("beforeSteamingStart") {
-                started = true
-            } else if line.contains("event=done") || line.contains("stream.onComplete") || line.contains("stopType: Complete") || line.contains("stopType: Error") {
-                stopped = true
+            // Only match actual stream events, not tool execution logs
+            if line.contains("[chatStreamService]") {
+                if line.contains("sendChatMessageStart") || line.contains("beforeSteamingStart") || line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") {
+                    currentState = true
+                } else if line.contains("stream.onComplete") || line.contains("stopType: Complete") || line.contains("stopType: Error") || line.contains("event=done") {
+                    currentState = false
+                }
             }
         }
-
-        if started {
-            streamStates[path] = true
+        
+        let previousState = streamStates[path] ?? false
+        streamStates[path] = currentState
+        
+        if currentState && !previousState {
             DispatchQueue.main.async { [weak self] in
                 self?.onAnyStart?()
             }
-        }
-        if stopped {
-            streamStates[path] = false
+        } else if !currentState && previousState {
             let anyRunning = streamStates.values.contains(true)
             if !anyRunning {
                 DispatchQueue.main.async { [weak self] in
