@@ -133,7 +133,7 @@ class TraeLogMonitor {
         var stopped = false
 
         content.enumerateLines { line, _ in
-            if line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") {
+            if line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") || line.contains("sendChatMessageStart") || line.contains("beforeSteamingStart") {
                 started = true
             } else if line.contains("event=done") || line.contains("stream.onComplete") || line.contains("stopType: Complete") || line.contains("stopType: Error") {
                 stopped = true
