@@ -5,6 +5,7 @@ import Foundation
 class FileWatcher {
     private var fileHandle: FileHandle?
     private var source: DispatchSourceFileSystemObject?
+    private var currentInode: UInt64 = 0
     let path: String
     var onNewLines: ((String) -> Void)?
 
@@ -13,16 +14,18 @@ class FileWatcher {
     }
 
     func start() {
-        guard FileManager.default.fileExists(atPath: path) else {
-            print("[trae-status-bar] File not found: \(path)")
-            return
-        }
-        guard let handle = FileHandle(forReadingAtPath: path) else {
-            print("[trae-status-bar] Cannot open file: \(path)")
-            return
-        }
-        handle.seekToEndOfFile()
+        openFile(seekToEnd: true)
+    }
+
+    private func openFile(seekToEnd: Bool) {
+        source?.cancel()
+        fileHandle?.closeFile()
+
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        guard let handle = FileHandle(forReadingAtPath: path) else { return }
+        if seekToEnd { handle.seekToEndOfFile() }
         self.fileHandle = handle
+        self.currentInode = Self.getInode(path) ?? 0
 
         let fd = handle.fileDescriptor
         let dispatchSource = DispatchSource.makeFileSystemObjectSource(
@@ -31,17 +34,29 @@ class FileWatcher {
             queue: .main
         )
         dispatchSource.setEventHandler { [weak self] in
-            self?.readNewLines()
+            self?.handleEvent()
         }
         dispatchSource.resume()
         self.source = dispatchSource
     }
 
-    private func readNewLines() {
+    private func handleEvent() {
+        checkRotation()
         guard let handle = fileHandle else { return }
         let data = handle.readDataToEndOfFile()
-        guard let content = String(data: data, encoding: .utf8) else { return }
+        guard !data.isEmpty, let content = String(data: data, encoding: .utf8) else { return }
         onNewLines?(content)
+    }
+
+    private func checkRotation() {
+        guard let newInode = Self.getInode(path), newInode != currentInode else { return }
+        openFile(seekToEnd: false)
+    }
+
+    private static func getInode(_ path: String) -> UInt64? {
+        var statBuf = stat()
+        guard stat(path, &statBuf) == 0 else { return nil }
+        return statBuf.st_ino
     }
 
     deinit {
@@ -233,6 +248,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var monitor: TraeLogMonitor?
     private var frameIndex = 0
+    private var lastActivityTime = Date()
     private let frames = ["◐", "◓", "◑", "◒"]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -249,12 +265,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         monitor = TraeLogMonitor(logsBase: "/Users/wav/Library/Application Support/Trae CN/logs")
         monitor?.onAnyStart = { [weak self] in
+            self?.lastActivityTime = Date()
             self?.startAnimation()
         }
         monitor?.onAllStop = { [weak self] in
             self?.stopAnimation()
         }
         monitor?.start()
+
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isAnimating else { return }
+            if Date().timeIntervalSince(self.lastActivityTime) > 60 {
+                print("[trae-status-bar] Safety timeout: stopping animation after 60s inactivity")
+                self.stopAnimation()
+            }
+        }
     }
 
     private func startAnimation() {
