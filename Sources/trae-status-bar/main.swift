@@ -74,13 +74,9 @@ class TraeLogMonitor {
     private var baseDirWatcher: DispatchSourceFileSystemObject?
     private var sessionDirWatcher: DispatchSourceFileSystemObject?
     private var rescanTimer: Timer?
-    private var pendingStopTimer: Timer?
-    private let stopGracePeriod: TimeInterval = 3.0
-    private var lastActivityTime: Date = Date()
-    private var safetyTimer: Timer?
-    private let safetyTimeout: TimeInterval = 30
     var onAnyStart: (() -> Void)?
     var onAllStop: (() -> Void)?
+    var onActivity: (() -> Void)?
     var activeCount: Int { streamStates.values.filter { $0 }.count }
 
     init(logsBase: String) {
@@ -166,8 +162,14 @@ class TraeLogMonitor {
         streamStates[path] = currentState
         
         if currentState && !previousState {
+            // State: idle -> running
             DispatchQueue.main.async { [weak self] in
                 self?.onAnyStart?()
+            }
+        } else if currentState && previousState {
+            // Continuously running — notify activity to reset safety timer
+            DispatchQueue.main.async { [weak self] in
+                self?.onActivity?()
             }
         } else if !currentState && previousState {
             let anyRunning = streamStates.values.contains(true)
@@ -268,15 +270,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.lastActivityTime = Date()
             self?.startAnimation()
         }
+        monitor?.onActivity = { [weak self] in
+            self?.lastActivityTime = Date()
+        }
         monitor?.onAllStop = { [weak self] in
             self?.stopAnimation()
         }
         monitor?.start()
 
+        // Safety timer: stop animation if no log activity for 90 seconds
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             guard let self = self, self.isAnimating else { return }
-            if Date().timeIntervalSince(self.lastActivityTime) > 60 {
-                print("[trae-status-bar] Safety timeout: stopping animation after 60s inactivity")
+            if Date().timeIntervalSince(self.lastActivityTime) > 90 {
+                print("[trae-status-bar] Safety timeout: stopping animation after 90s inactivity")
                 self.stopAnimation()
             }
         }
