@@ -5,12 +5,13 @@ import Foundation
 enum Config {
     /// 会话目录被视为"存活"的最大静默时间（该会话所有文件无任何日志写入则视为已关闭）
     static let sessionStaleThreshold: TimeInterval = 6 * 3600
-    /// 无日志活动后停止动画的安全超时
-    static let animationTimeout: TimeInterval = 90
     /// 目录重扫间隔（秒）
     static let rescanInterval: TimeInterval = 5
     /// 新挂载 watcher 时回读文件尾部的字节数，用于初始化窗口的流状态
     static let tailBytes: Int = 20_000
+    /// 看门狗：一个窗口处于"运行中"但持续这么久没有任何 chatStreamService 新日志，则强制复位为空闲。
+    /// 用于兜底各种未识别的异常结束路径（如仅打印 stream.onError / 直接中断）导致的状态卡死。
+    static let streamStallTimeout: TimeInterval = 180
     /// Trae 日志根目录
     static let logsBase = "/Users/wav/Library/Application Support/Trae CN/logs"
 }
@@ -98,6 +99,7 @@ class TraeLogMonitor {
     struct SessionInfo {
         var path: String
         var windowStates: [String: Bool] = [:] // windowLogPath -> isRunning
+        var windowSeenAt: [String: Date] = [:] // windowLogPath -> 最近一次 chatStreamService 日志时间
     }
 
     private var sessions: [String: SessionInfo] = [:] // sessionId -> info
@@ -123,6 +125,19 @@ class TraeLogMonitor {
             .sorted { $0.name < $1.name }
     }
 
+    /// 该会话当前是否有窗口在流式输出
+    func sessionRunning(_ sessionId: String) -> Bool {
+        guard let info = sessions[sessionId] else { return false }
+        return info.windowStates.values.contains(true)
+    }
+
+    /// 所有会话中进行中的会话个数
+    var activeSessionCount: Int {
+        sessions.values.reduce(0) { count, info in
+            info.windowStates.values.contains(true) ? count + 1 : count
+        }
+    }
+
     init(logsBase: String) {
         self.logsBase = logsBase
     }
@@ -132,6 +147,8 @@ class TraeLogMonitor {
         watchBaseDir()
         rescanTimer = Timer.scheduledTimer(withTimeInterval: Config.rescanInterval, repeats: true) { [weak self] _ in
             self?.scanAndWatch()
+            // 看门狗：把僵死的 running 窗口复位为空闲（5 秒一次，远小于阈值）
+            _ = self?.sweepStaleStreams()
         }
     }
 
@@ -174,12 +191,12 @@ class TraeLogMonitor {
     }
 
     private func refreshWindows(for sessionId: String) {
-        guard var info = sessions[sessionId] else { return }
-        let sessionPath = info.path
+        guard sessions[sessionId] != nil else { return }
+        let sessionPath = sessions[sessionId]!.path
         guard let windows = try? FileManager.default.contentsOfDirectory(atPath: sessionPath)
             .filter({ $0.hasPrefix("window") }) else { return }
 
-        let watchedPaths = Set(info.windowStates.keys)
+        let watchedPaths = Set(sessions[sessionId]!.windowStates.keys)
         var currentPaths = Set<String>()
 
         for window in windows {
@@ -189,7 +206,10 @@ class TraeLogMonitor {
 
             if watchedPaths.contains(logPath) { continue }
 
-            info.windowStates[logPath] = false
+            // 就地登记为空闲；随后 readTail -> parseLines 会直接就地更新 sessions[sessionId]
+            // 的 running 状态。这里绝不能用快照覆盖回去，否则会冲掉 parseLines 已写入的
+            // "运行中" 状态（这是"正在输出却不转圈/显示空闲"的根因）。
+            sessions[sessionId]?.windowStates[logPath] = false
             let w = FileWatcher(path: logPath)
             w.onNewLines = { [weak self] content in
                 self?.parseLines(content, sessionId: sessionId, logPath: logPath)
@@ -197,42 +217,56 @@ class TraeLogMonitor {
             w.start()
             watchers[logPath] = w
             print("[trae-status-bar] Watching: \(logPath)")
-            // 回读尾部，初始化窗口状态，避免漏掉已开始的流
+            // 回读尾部，初始化窗口状态，避免漏掉已开始的流（就地更新 sessions[sessionId]）
             w.readTail(Config.tailBytes)
         }
 
-        // 移除已删除的窗口
+        // 移除已删除的窗口（就地修改）
         let removedPaths = watchedPaths.subtracting(currentPaths)
         if !removedPaths.isEmpty {
             for path in removedPaths {
-                info.windowStates.removeValue(forKey: path)
+                sessions[sessionId]?.windowStates.removeValue(forKey: path)
+                sessions[sessionId]?.windowSeenAt.removeValue(forKey: path)
                 watchers.removeValue(forKey: path)
             }
             print("[trae-status-bar] Removed windows: \(removedPaths)")
         }
-
-        sessions[sessionId] = info
     }
 
     // MARK: 日志解析
 
     private func parseLines(_ content: String, sessionId: String, logPath: String) {
         guard var info = sessions[sessionId] else { return }
+        let now = Date()
         var currentState = info.windowStates[logPath] ?? false
+        var touchSeen = false
+        var toggled = false
 
         content.enumerateLines { line, _ in
-            // Only match actual stream events, not tool execution logs
-            if line.contains("[chatStreamService]") {
-                if line.contains("sendChatMessageStart") || line.contains("beforeSteamingStart") || line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") {
-                    currentState = true
-                } else if line.contains("stream.onComplete") || line.contains("stopType: Complete") || line.contains("stopType: Error") || line.contains("event=done") {
-                    currentState = false
-                }
+            guard line.contains("[chatStreamService]") else { return }
+            touchSeen = true
+
+            if line.contains("sendChatMessageStart") || line.contains("beforeSteamingStart") || line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") {
+                currentState = true
+                toggled = true
+            } else if self.isEndMarker(line) {
+                currentState = false
+                toggled = true
             }
+        }
+
+        // 只要该窗口这条日志里有 chatStreamService 活动，就把它视为"仍在输出"的心跳，
+        // 刷新 seenAt，看门狗据此刻判断窗口是否僵死。
+        if touchSeen {
+            info.windowSeenAt[logPath] = now
         }
 
         let previousState = info.windowStates[logPath] ?? false
         info.windowStates[logPath] = currentState
+        // 复位时清掉该窗口的历史心率记录，避免残留
+        if !currentState {
+            info.windowSeenAt.removeValue(forKey: logPath)
+        }
         sessions[sessionId] = info
 
         if currentState && !previousState {
@@ -240,8 +274,8 @@ class TraeLogMonitor {
             DispatchQueue.main.async { [weak self] in
                 self?.onSessionStart?(sessionId)
             }
-        } else if currentState && previousState {
-            // 持续运行——刷新安全计时器
+        } else if currentState && previousState && toggled {
+            // State: running -> running（有新一行活动，但不涉及开始/结束转换）
             DispatchQueue.main.async { [weak self] in
                 self?.onSessionActivity?(sessionId)
             }
@@ -253,6 +287,55 @@ class TraeLogMonitor {
                 }
             }
         }
+    }
+
+    /// 流式结束 / 中断 / 错误的日志标记
+    private func isEndMarker(_ line: String) -> Bool {
+        line.contains("stream.onComplete") ||
+        line.contains("stream.onError") ||
+        line.contains("stream.onAbort") ||
+        line.contains("stopType: Complete") ||
+        line.contains("stopType: Error") ||
+        line.contains("stopType: Abort") ||
+        line.contains("stopType: Interrupted") ||
+        line.contains("event=done")
+    }
+
+    /// 看门狗：把"标记为运行中但长时间没有任何 chatStreamService 新日志"的窗口强制复位为空闲，
+    /// 兜底一切未识别结束路径导致的卡死。返回是否有窗口被复位。
+    private func sweepStaleStreams() -> Bool {
+        let now = Date()
+        var resetSessions = Set<String>()
+        var changed = false
+
+        for sessionId in sessions.keys {
+            guard var info = sessions[sessionId] else { continue }
+            var mutated = false
+            for (path, running) in info.windowStates where running {
+                // 若该窗口从起始就没有任何心跳（例如 pending 状态），同样纳入看门狗判定
+                let seen = info.windowSeenAt[path] ?? Date.distantPast
+                if now.timeIntervalSince(seen) > Config.streamStallTimeout {
+                    info.windowStates[path] = false
+                    info.windowSeenAt.removeValue(forKey: path)
+                    print("[trae-status-bar] Stalled window reset to idle: \(path)")
+                    mutated = true
+                }
+            }
+            if mutated {
+                changed = true
+                sessions[sessionId] = info
+                if !info.windowStates.values.contains(true) {
+                    resetSessions.insert(sessionId)
+                }
+            }
+        }
+
+        for sessionId in resetSessions {
+            DispatchQueue.main.async { [weak self] in
+                self?.onSessionStop?(sessionId)
+            }
+        }
+        return changed
     }
 
     // MARK: 存活判定
@@ -325,163 +408,125 @@ class TraeLogMonitor {
     }
 }
 
-// MARK: - 单个会话的状态栏条目
-class SessionStatusItem {
-    let sessionId: String
-    let statusItem: NSStatusItem
-    private let menu: NSMenu
-    private let titleItem: NSMenuItem
-    private var windowItems: [NSMenuItem] = []
+// MARK: - 单个聚合状态栏条目
+class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem!
+    private var monitor: TraeLogMonitor?
     private var isAnimating = false
     private var timer: Timer?
     private var frameIndex = 0
-    private var lastActivity = Date()
     private let frames = ["◐", "◓", "◑", "◒"]
 
-    /// 20260812T145615 -> 14:56
-    static func shortLabel(for sessionId: String) -> String {
-        let chars = Array(sessionId)
-        guard chars.count >= 13 else { return sessionId }
-        return "\(chars[9])\(chars[10]):\(chars[11])\(chars[12])"
-    }
+    private var activeCount: Int { monitor?.activeSessionCount ?? 0 }
 
-    init(sessionId: String) {
-        self.sessionId = sessionId
+    func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .regular)
-        statusItem.button?.toolTip = "Trae 会话 \(sessionId)"
-
-        menu = NSMenu()
-        titleItem = NSMenuItem(title: "Trae 会话 \(sessionId): 空闲", action: nil, keyEquivalent: "")
-        menu.addItem(titleItem)
-        menu.addItem(NSMenuItem.separator())
-        let quit = NSMenuItem(title: "Quit trae-status-bar", action: #selector(AppDelegate.quitAll), keyEquivalent: "q")
-        quit.target = NSApp.delegate
-        menu.addItem(quit)
-        statusItem.menu = menu
-
+        statusItem.button?.toolTip = "Trae 会话状态"
+        statusItem.menu = NSMenu()
         setTitle("⬤")
+        rebuildMenu()
+
+        monitor = TraeLogMonitor(logsBase: Config.logsBase)
+        monitor?.onSessionAdded = { [weak self] _ in
+            self?.syncState()
+        }
+        monitor?.onSessionRemoved = { [weak self] _ in
+            self?.syncState()
+        }
+        monitor?.onSessionStart = { [weak self] _ in
+            self?.syncState()
+        }
+        monitor?.onSessionStop = { [weak self] _ in
+            self?.syncState()
+        }
+        monitor?.start()
+
+        // 周期性刷新菜单中的窗口状态
+        Timer.scheduledTimer(withTimeInterval: Config.rescanInterval, repeats: true) { [weak self] _ in
+            self?.rebuildMenu()
+        }
     }
 
-    private func setTitle(_ text: String) {
-        statusItem.button?.title = "\(Self.shortLabel(for: sessionId)) \(text)"
+    /// 根据当前进行中的会话个数刷新动画与标题
+    private func syncState() {
+        let n = activeCount
+        if n > 0 {
+            startAnimation()
+            updateTitle() // 用当前计数立即刷新标题
+        } else {
+            stopAnimation()
+        }
+        rebuildMenu()
     }
 
-    func startAnimation() {
+    private func startAnimation() {
         guard !isAnimating else { return }
         isAnimating = true
-        titleItem.title = "Trae 会话 \(sessionId): 运行中"
         frameIndex = 0
-        setTitle(frames[0])
+        setTitle(frames[0] + "\(activeCount)")
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self else { return }
+            guard let self, self.isAnimating else { return }
             self.frameIndex = (self.frameIndex + 1) % self.frames.count
-            self.setTitle(self.frames[self.frameIndex])
+            self.setTitle(self.frames[self.frameIndex] + "\(self.activeCount)")
         }
-        print("[trae-status-bar] Animation started: \(sessionId)")
+        print("[trae-status-bar] Animation started (active sessions: \(activeCount))")
     }
 
-    func stopAnimation() {
+    private func stopAnimation() {
         guard isAnimating else { return }
         isAnimating = false
         timer?.invalidate()
         timer = nil
         setTitle("⬤")
-        titleItem.title = "Trae 会话 \(sessionId): 空闲"
-        print("[trae-status-bar] Animation stopped: \(sessionId)")
+        print("[trae-status-bar] Animation stopped")
     }
 
-    func noteActivity() {
-        lastActivity = Date()
-    }
-
-    /// 安全超时检查：该会话持续动画但无任何日志活动
-    func checkTimeout() {
-        guard isAnimating, Date().timeIntervalSince(lastActivity) > Config.animationTimeout else { return }
-        print("[trae-status-bar] Safety timeout: session \(sessionId)")
-        stopAnimation()
-    }
-
-    /// 刷新菜单中的窗口状态列表
-    func updateWindows(_ windows: [(name: String, running: Bool)]) {
-        for item in windowItems {
-            menu.removeItem(item)
-        }
-        windowItems.removeAll()
-
-        var insertIndex = 2 // 0=标题, 1=分隔线, 之后是窗口列表, 最后是 Quit
-        for w in windows {
-            let item = NSMenuItem(title: "\(w.name): \(w.running ? "运行中" : "空闲")", action: nil, keyEquivalent: "")
-            menu.insertItem(item, at: insertIndex)
-            windowItems.append(item)
-            insertIndex += 1
+    private func updateTitle() {
+        if isAnimating {
+            setTitle(frames[frameIndex] + "\(activeCount)")
+        } else {
+            setTitle("⬤")
         }
     }
 
-    deinit {
-        timer?.invalidate()
-        NSStatusBar.system.removeStatusItem(statusItem)
+    private func setTitle(_ text: String) {
+        statusItem.button?.title = text
     }
-}
 
-// MARK: - App Delegate
-class AppDelegate: NSObject, NSApplicationDelegate {
-    private var monitor: TraeLogMonitor?
-    private var sessionItems: [String: SessionStatusItem] = [:]
+    /// 重建菜单：聚合标题 + 每个会话的状态（含其窗口列表子菜单）
+    private func rebuildMenu() {
+        guard let menu = statusItem.menu else { return }
+        menu.removeAllItems()
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        monitor = TraeLogMonitor(logsBase: Config.logsBase)
+        let title = activeCount > 0 ? "Trae: \(activeCount) 个会话进行中" : "Trae: 空闲"
+        let titleItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        menu.addItem(titleItem)
+        menu.addItem(NSMenuItem.separator())
 
-        monitor?.onSessionAdded = { [weak self] sessionId in
-            self?.addSessionItem(sessionId)
-        }
-        monitor?.onSessionRemoved = { [weak self] sessionId in
-            self?.removeSessionItem(sessionId)
-        }
-        monitor?.onSessionStart = { [weak self] sessionId in
-            guard let self, let item = self.sessionItems[sessionId] else { return }
-            item.noteActivity()
-            item.startAnimation()
-            item.updateWindows(self.monitor?.windowStates(for: sessionId) ?? [])
-        }
-        monitor?.onSessionStop = { [weak self] sessionId in
-            guard let self, let item = self.sessionItems[sessionId] else { return }
-            item.stopAnimation()
-            item.updateWindows(self.monitor?.windowStates(for: sessionId) ?? [])
-        }
-        monitor?.onSessionActivity = { [weak self] sessionId in
-            self?.sessionItems[sessionId]?.noteActivity()
-        }
-        monitor?.start()
-
-        // 安全超时轮询：每个动画中的会话若无日志活动则停止
-        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            for item in self.sessionItems.values {
-                item.checkTimeout()
+        let ids = monitor?.sessionIds ?? []
+        if ids.isEmpty {
+            menu.addItem(NSMenuItem(title: "（暂无存活会话）", action: nil, keyEquivalent: ""))
+        } else {
+            for sessionId in ids {
+                let running = monitor?.sessionRunning(sessionId) ?? false
+                let windows = monitor?.windowStates(for: sessionId) ?? []
+                let item = NSMenuItem(title: "会话 \(sessionId) — \(running ? "运行中" : "空闲")",
+                                      action: nil, keyEquivalent: "")
+                let sub = NSMenu()
+                for w in windows.isEmpty ? [(name: "（无窗口）", running: false)] : windows {
+                    sub.addItem(NSMenuItem(title: "\(w.name): \(w.running ? "运行中" : "空闲")",
+                                           action: nil, keyEquivalent: ""))
+                }
+                item.submenu = sub
+                menu.addItem(item)
             }
         }
 
-        // 周期性刷新各会话菜单中的窗口状态
-        Timer.scheduledTimer(withTimeInterval: Config.rescanInterval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            for (id, item) in self.sessionItems {
-                item.updateWindows(self.monitor?.windowStates(for: id) ?? [])
-            }
-        }
-    }
-
-    private func addSessionItem(_ sessionId: String) {
-        guard sessionItems[sessionId] == nil else { return }
-        let item = SessionStatusItem(sessionId: sessionId)
-        sessionItems[sessionId] = item
-        item.updateWindows(monitor?.windowStates(for: sessionId) ?? [])
-        print("[trae-status-bar] Status item added: \(sessionId)")
-    }
-
-    private func removeSessionItem(_ sessionId: String) {
-        guard sessionItems.removeValue(forKey: sessionId) != nil else { return }
-        print("[trae-status-bar] Status item removed: \(sessionId)")
+        menu.addItem(NSMenuItem.separator())
+        let quit = NSMenuItem(title: "Quit trae-status-bar", action: #selector(quitAll), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
     }
 
     @objc func quitAll() {

@@ -4,14 +4,19 @@ macOS 菜单栏状态指示器：监控 Trae 的日志，实时显示每个会�
 
 ## 功能
 
-- **多会话支持**：监控 `~/Library/Application Support/Trae CN/logs` 下所有"存活"的会话目录
-  （每个会话目录 = Trae 的一次应用会话），每个会话在菜单栏**独立显示**一个图标：
-  - 空闲：`14:56 ⬤`（会话启动时刻 + 实心圆点）
-  - 运行中：`14:56 ◐◓◑◒`（旋转动画）
-- 点击图标弹出该会话的菜单：会话 ID、各窗口状态（`windowN: 运行中/空闲`）、Quit
+- **聚合状态栏**：菜单栏单个图标
+  - 空闲：`⬤`（实心圆点）
+  - 有会话进行中：`◐N`、`◒N` …（旋转动画 + 进行中的会话个数 N）
+- **多会话监控**：监控 `~/Library/Application Support/Trae CN/logs` 下所有"存活"的会话目录
+  （每个会话目录 = Trae 的一次应用会话），统计其中正在流式输出的会话个数
+- 点击图标弹出菜单：聚合标题（"Trae: N 个会话进行中 / 空闲"）、每个会话的状态
+  （会话 ID + 运行中/空闲，子菜单列出各窗口 `windowN` 状态）、Quit
 - 会话"存活"判定：目录内任意日志文件在 6 小时内有过写入（`Config.sessionStaleThreshold`，
-  可在 `Sources/trae-status-bar/main.swift` 顶部调整），过期会话自动从菜单栏移除，避免堆积
-- 安全超时：某个会话持续动画但 90 秒内无任何日志活动，自动停止动画（防止卡死）
+  可在 `Sources/trae-status-bar/main.swift` 顶部调整），过期会话自动忽略，避免堆积
+- 卡死兜底（两层）：① 结束标记覆盖正常/异常/中断路径（`stream.onComplete`、`stream.onError`、
+  `stopType: Complete|Error|Abort|Interrupted`、`event=done`）；② 看门狗：某窗口被判定为"运行中"
+  但超过 `Config.streamStallTimeout`（默认 180s）没再收到任何 `chatStreamService` 心跳日志，
+  自动复位为空闲并停止动画，防止"异常中止但一直转圈"。
 
 ## 编译运行
 
