@@ -9,9 +9,10 @@ enum Config {
     static let rescanInterval: TimeInterval = 5
     /// 新挂载 watcher 时回读文件尾部的字节数，用于初始化窗口的流状态
     static let tailBytes: Int = 20_000
-    /// 看门狗：一个窗口处于"运行中"但持续这么久没有任何 chatStreamService 新日志，则强制复位为空闲。
+    /// 看门狗：一个窗口处于"运行中"但其 renderer.log 文件持续这么久没有任何写入，则强制复位为空闲。
+    /// 活跃判定用文件修改时间（任何日志写入都算），避免因 chatStreamService 心跳行较长静默而误杀仍在进行的会话。
     /// 用于兜底各种未识别的异常结束路径（如仅打印 stream.onError / 直接中断）导致的状态卡死。
-    static let streamStallTimeout: TimeInterval = 180
+    static let streamStallTimeout: TimeInterval = 300
     /// Trae 日志根目录
     static let logsBase = "/Users/wav/Library/Application Support/Trae CN/logs"
 }
@@ -99,7 +100,6 @@ class TraeLogMonitor {
     struct SessionInfo {
         var path: String
         var windowStates: [String: Bool] = [:] // windowLogPath -> isRunning
-        var windowSeenAt: [String: Date] = [:] // windowLogPath -> 最近一次 chatStreamService 日志时间
     }
 
     private var sessions: [String: SessionInfo] = [:] // sessionId -> info
@@ -226,7 +226,6 @@ class TraeLogMonitor {
         if !removedPaths.isEmpty {
             for path in removedPaths {
                 sessions[sessionId]?.windowStates.removeValue(forKey: path)
-                sessions[sessionId]?.windowSeenAt.removeValue(forKey: path)
                 watchers.removeValue(forKey: path)
             }
             print("[trae-status-bar] Removed windows: \(removedPaths)")
@@ -237,14 +236,11 @@ class TraeLogMonitor {
 
     private func parseLines(_ content: String, sessionId: String, logPath: String) {
         guard var info = sessions[sessionId] else { return }
-        let now = Date()
         var currentState = info.windowStates[logPath] ?? false
-        var touchSeen = false
         var toggled = false
 
         content.enumerateLines { line, _ in
             guard line.contains("[chatStreamService]") else { return }
-            touchSeen = true
 
             if line.contains("sendChatMessageStart") || line.contains("beforeSteamingStart") || line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") {
                 currentState = true
@@ -255,18 +251,8 @@ class TraeLogMonitor {
             }
         }
 
-        // 只要该窗口这条日志里有 chatStreamService 活动，就把它视为"仍在输出"的心跳，
-        // 刷新 seenAt，看门狗据此刻判断窗口是否僵死。
-        if touchSeen {
-            info.windowSeenAt[logPath] = now
-        }
-
         let previousState = info.windowStates[logPath] ?? false
         info.windowStates[logPath] = currentState
-        // 复位时清掉该窗口的历史心率记录，避免残留
-        if !currentState {
-            info.windowSeenAt.removeValue(forKey: logPath)
-        }
         sessions[sessionId] = info
 
         if currentState && !previousState {
@@ -301,8 +287,9 @@ class TraeLogMonitor {
         line.contains("event=done")
     }
 
-    /// 看门狗：把"标记为运行中但长时间没有任何 chatStreamService 新日志"的窗口强制复位为空闲，
-    /// 兜底一切未识别结束路径导致的卡死。返回是否有窗口被复位。
+    /// 看门狗：把"标记为运行中但 renderer.log 文件已长时间不再写入"的窗口强制复位为空闲，
+    /// 兜底一切未识别结束路径导致的卡死。活跃判定用文件本身的修改时间（任何日志写入都算），
+    /// 而不是 chatStreamService 心跳行——真实进行中的对话可能长时间不写这类行，用前者可避免误杀。
     private func sweepStaleStreams() -> Bool {
         let now = Date()
         var resetSessions = Set<String>()
@@ -312,11 +299,9 @@ class TraeLogMonitor {
             guard var info = sessions[sessionId] else { continue }
             var mutated = false
             for (path, running) in info.windowStates where running {
-                // 若该窗口从起始就没有任何心跳（例如 pending 状态），同样纳入看门狗判定
-                let seen = info.windowSeenAt[path] ?? Date.distantPast
-                if now.timeIntervalSince(seen) > Config.streamStallTimeout {
+                let mtime = fileModificationDate(path)
+                if now.timeIntervalSince(mtime) > Config.streamStallTimeout {
                     info.windowStates[path] = false
-                    info.windowSeenAt.removeValue(forKey: path)
                     print("[trae-status-bar] Stalled window reset to idle: \(path)")
                     mutated = true
                 }
@@ -336,6 +321,15 @@ class TraeLogMonitor {
             }
         }
         return changed
+    }
+
+    /// 文件最后修改时间；文件不存在或读取失败返回 distantPast（视为长时间未活跃）
+    private func fileModificationDate(_ path: String) -> Date {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let d = attrs[.modificationDate] as? Date else {
+            return Date.distantPast
+        }
+        return d
     }
 
     // MARK: 存活判定

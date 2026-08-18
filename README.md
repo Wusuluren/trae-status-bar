@@ -15,8 +15,9 @@ macOS 菜单栏状态指示器：监控 Trae 的日志，实时显示每个会�
   可在 `Sources/trae-status-bar/main.swift` 顶部调整），过期会话自动忽略，避免堆积
 - 卡死兜底（两层）：① 结束标记覆盖正常/异常/中断路径（`stream.onComplete`、`stream.onError`、
   `stopType: Complete|Error|Abort|Interrupted`、`event=done`）；② 看门狗：某窗口被判定为"运行中"
-  但超过 `Config.streamStallTimeout`（默认 180s）没再收到任何 `chatStreamService` 心跳日志，
-  自动复位为空闲并停止动画，防止"异常中止但一直转圈"。
+  但其 renderer.log **文件本身**超过 `Config.streamStallTimeout`（默认 300s）再无任何写入，
+  才强制复位为空闲并停止动画。活跃判定用文件修改时间（任何日志写入都算）——真实进行中的会话
+  即使暂时不写 `chatStreamService` 心跳行也不会被误杀。
 
 ## 编译运行
 
