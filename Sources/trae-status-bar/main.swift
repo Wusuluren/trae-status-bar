@@ -240,9 +240,9 @@ class TraeLogMonitor {
         var toggled = false
 
         content.enumerateLines { line, _ in
-            guard line.contains("[chatStreamService]") else { return }
+            guard line.contains("[chatStreamService]") || line.contains("[ai-chat/v2]") else { return }
 
-            if line.contains("sendChatMessageStart") || line.contains("beforeSteamingStart") || line.contains("doRequestWithStream start") || line.contains("streaming start") || line.contains("calling chat API") {
+            if self.isStartMarker(line) {
                 currentState = true
                 toggled = true
             } else if self.isEndMarker(line) {
@@ -275,7 +275,20 @@ class TraeLogMonitor {
         }
     }
 
-    /// 流式结束 / 中断 / 错误的日志标记
+    /// 流式开始标记，兼容旧版 chatStreamService 和 Trae 3.3.90 ai-chat/v2。
+    private func isStartMarker(_ line: String) -> Bool {
+        if line.contains("[chatStreamService]") {
+            return line.contains("sendChatMessageStart") ||
+                line.contains("beforeSteamingStart") ||
+                line.contains("doRequestWithStream start") ||
+                line.contains("streaming start") ||
+                line.contains("calling chat API")
+        }
+        return line.contains("[ai-chat/v2] [StreamDomainService] Stream started") ||
+            (line.contains("[ai-chat/v2] [SessionStatusTrace] Session status changed") && line.contains("\"nextStatus\":3"))
+    }
+
+    /// 流式结束 / 中断 / 错误的日志标记。
     private func isEndMarker(_ line: String) -> Bool {
         line.contains("stream.onComplete") ||
         line.contains("stream.onError") ||
@@ -284,7 +297,12 @@ class TraeLogMonitor {
         line.contains("stopType: Error") ||
         line.contains("stopType: Abort") ||
         line.contains("stopType: Interrupted") ||
-        line.contains("event=done")
+        line.contains("event=done") ||
+        line.contains("[ai-chat/v2] [NotificationPort] Stream stopped") ||
+        line.contains("[ai-chat/v2] [StreamDomainService] Stream finalized") ||
+        line.contains("[ai-chat/v2] [stream-diagnostics][done] done finalized stream") ||
+        (line.contains("[ai-chat/v2] [SessionStatusTrace] Session status changed") &&
+            (line.contains("\"nextStatus\":4") || line.contains("\"nextStatus\":5")))
     }
 
     /// 看门狗：把"标记为运行中但 renderer.log 文件已长时间不再写入"的窗口强制复位为空闲，
