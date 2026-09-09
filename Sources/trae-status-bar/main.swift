@@ -13,6 +13,9 @@ enum Config {
     /// 活跃判定用文件修改时间（任何日志写入都算），避免因 chatStreamService 心跳行较长静默而误杀仍在进行的会话。
     /// 用于兜底各种未识别的异常结束路径（如仅打印 stream.onError / 直接中断）导致的状态卡死。
     static let streamStallTimeout: TimeInterval = 300
+    /// 窗口日志超过这么久没有任何写入，视为已关闭窗口：不监听、不在菜单展示。
+    /// Trae 关闭窗口后不删除其 windowN 日志目录，需按 mtime 过滤历史残留。
+    static let windowStaleThreshold: TimeInterval = 24 * 3600
     /// Trae 日志根目录
     static let logsBase = "/Users/wav/Library/Application Support/Trae CN/logs"
 }
@@ -157,10 +160,18 @@ class TraeLogMonitor {
     private func scanAndWatch() {
         guard let contents = try? FileManager.default.contentsOfDirectory(atPath: logsBase) else { return }
 
+        // 优先以运行中的 Trae 进程参数为准（--aha-log-session-time=YYYYMMDDTHHMMSS），
+        // 避免 Trae 启动/退出时回写历史会话目录的 mtime 把已关闭会话误判为存活。
+        let processLiveIds = Self.liveSessionIdsFromProcesses()
         let live = contents
             .filter(Self.isSessionDir)
             .filter { Self.hasWindows(in: "\(logsBase)/\($0)") }
-            .filter { isSessionLive("\(logsBase)/\($0)") }
+            .filter { sessionId in
+                if let ids = processLiveIds {
+                    return ids.contains(sessionId)
+                }
+                return isSessionLive("\(logsBase)/\(sessionId)")
+            }
             .sorted()
         let liveSet = Set(live)
 
@@ -202,6 +213,8 @@ class TraeLogMonitor {
         for window in windows {
             let logPath = "\(sessionPath)/\(window)/renderer.log"
             guard FileManager.default.fileExists(atPath: logPath) else { continue }
+            // 长期无写入的窗口目录视为已关闭窗口，跳过挂载（已监听的会经 removedPaths 移除）
+            if Date().timeIntervalSince(fileModificationDate(logPath)) > Config.windowStaleThreshold { continue }
             currentPaths.insert(logPath)
 
             if watchedPaths.contains(logPath) { continue }
@@ -276,6 +289,8 @@ class TraeLogMonitor {
     }
 
     /// 流式开始标记，兼容旧版 chatStreamService 和 Trae 3.3.90 ai-chat/v2。
+    /// 注意：SessionStatusTrace 的 nextStatus 行是跨窗口广播（frontier.session_updated），
+    /// 会被写入所有窗口的 renderer.log，不能作为本窗口流状态依据。
     private func isStartMarker(_ line: String) -> Bool {
         if line.contains("[chatStreamService]") {
             return line.contains("sendChatMessageStart") ||
@@ -285,7 +300,7 @@ class TraeLogMonitor {
                 line.contains("calling chat API")
         }
         return line.contains("[ai-chat/v2] [StreamDomainService] Stream started") ||
-            (line.contains("[ai-chat/v2] [SessionStatusTrace] Session status changed") && line.contains("\"nextStatus\":3"))
+            line.contains("[ai-chat/v2] [NotificationPort] Stream started")
     }
 
     /// 流式结束 / 中断 / 错误的日志标记。
@@ -300,9 +315,7 @@ class TraeLogMonitor {
         line.contains("event=done") ||
         line.contains("[ai-chat/v2] [NotificationPort] Stream stopped") ||
         line.contains("[ai-chat/v2] [StreamDomainService] Stream finalized") ||
-        line.contains("[ai-chat/v2] [stream-diagnostics][done] done finalized stream") ||
-        (line.contains("[ai-chat/v2] [SessionStatusTrace] Session status changed") &&
-            (line.contains("\"nextStatus\":4") || line.contains("\"nextStatus\":5")))
+        line.contains("[ai-chat/v2] [stream-diagnostics][done] done finalized stream")
     }
 
     /// 看门狗：把"标记为运行中但 renderer.log 文件已长时间不再写入"的窗口强制复位为空闲，
@@ -404,6 +417,32 @@ class TraeLogMonitor {
     }
 
     private static let sessionPattern = try! NSRegularExpression(pattern: #"^\d{8}T\d{6}$"#)
+
+    /// 从运行中的 Trae 进程命令行提取存活会话 ID。解析失败或无结果时返回 nil，
+    /// 由调用方回退到 mtime 启发式（isSessionLive）。
+    private static func liveSessionIdsFromProcesses() -> Set<String>? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-axo", "command="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard let out = String(data: data, encoding: .utf8) else { return nil }
+
+        let ids = out.split(separator: "\n").compactMap { line -> String? in
+            guard let range = line.range(of: "--aha-log-session-time=") else { return nil }
+            let value = line[range.upperBound...].prefix(15)
+            return value.isEmpty ? nil : String(value)
+        }
+        return ids.isEmpty ? nil : Set(ids)
+    }
 
     private static func isSessionDir(_ name: String) -> Bool {
         sessionPattern.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
