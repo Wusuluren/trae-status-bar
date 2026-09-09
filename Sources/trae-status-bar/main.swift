@@ -47,6 +47,27 @@ class FileWatcher {
         onNewLines?(content)
     }
 
+    /// 轮询式轮转恢复：renderer.log 写满 10MB 会被 rename 成 renderer.1.log 并新建同名文件。
+    /// 旧 fd 指向被换走的 inode，永远收不到写入事件，事件驱动的 checkRotation 因此永不触发，
+    /// watcher 永久失联（状态卡死在 running 的根因）。由定时器每 5 秒调用本方法兜底。
+    func reopenIfNeeded() {
+        guard let newInode = Self.getInode(path), newInode != currentInode else { return }
+        // 排空旧文件残余，避免轮转瞬间写入的尾部 marker 丢失
+        if let handle = fileHandle {
+            let data = handle.readDataToEndOfFile()
+            if let content = String(data: data, encoding: .utf8), !content.isEmpty {
+                onNewLines?(content)
+            }
+        }
+        openFile(seekToEnd: false)
+        guard let handle = fileHandle else { return }
+        // 新文件从头重放一次，恢复轮转期间错过的 start/end 序列
+        let data = handle.readDataToEndOfFile()
+        if let content = String(data: data, encoding: .utf8), !content.isEmpty {
+            onNewLines?(content)
+        }
+    }
+
     private func openFile(seekToEnd: Bool) {
         source?.cancel()
         fileHandle?.closeFile()
@@ -150,8 +171,16 @@ class TraeLogMonitor {
         watchBaseDir()
         rescanTimer = Timer.scheduledTimer(withTimeInterval: Config.rescanInterval, repeats: true) { [weak self] _ in
             self?.scanAndWatch()
+            // 轮转自愈：renderer.log 滚动后旧 fd 失联，轮询 inode 重新挂载
+            self?.checkWatcherRotation()
             // 看门狗：把僵死的 running 窗口复位为空闲（5 秒一次，远小于阈值）
             _ = self?.sweepStaleStreams()
+        }
+    }
+
+    private func checkWatcherRotation() {
+        for watcher in watchers.values {
+            watcher.reopenIfNeeded()
         }
     }
 
