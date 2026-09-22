@@ -121,45 +121,93 @@ class FileWatcher {
 /// 并为每个会话内的每个 window 挂载 renderer.log watcher。
 /// 所有回调均在主线程派发，按 sessionId 区分。
 class TraeLogMonitor {
-    struct SessionInfo {
-        var path: String
-        var windowStates: [String: Bool] = [:] // windowLogPath -> isRunning
+    /// Trae 业务层的 chat session（一次 AI 对话 = 一个 chat session；多个 Trae 窗口可共享）。
+    /// 名字（title / workspace basename）从 renderer.log 的 Session fetched/updated 事件提取。
+    struct ChatSessionInfo {
+        var title: String = ""           // Session updated 携带的标题
+        var workspacePath: String = ""   // Session fetched 携带的工作区路径
+        var createdAt: Date? = nil       // Session fetched 的 created_at（毫秒）
+        /// 仍在哪些 windowPath 上跑（用于跨窗口共享 stream 事件的去重）
+        var runningWindows: Set<String> = []
+        /// 看到过该 chat session 的 window 集合（用于窗口消失时 GC）
+        var seenInWindows: Set<String> = []
+        /// 最后一次看到该 chat session 的时间戳（用于在菜单中排序与陈旧 GC）
+        var lastSeenAt: TimeInterval = 0
+        var isRunning: Bool { !runningWindows.isEmpty }
+        /// 显示名：title > workspace basename > 短 ID
+        var displayName: String {
+            if !title.isEmpty { return title }
+            if !workspacePath.isEmpty {
+                return (workspacePath as NSString).lastPathComponent
+            }
+            return "会话"
+        }
+        /// 工作区短名（用于菜单前缀），空时返回 nil
+        var workspaceShort: String? {
+            workspacePath.isEmpty ? nil : (workspacePath as NSString).lastPathComponent
+        }
+        /// 用于兜底的短 ID（取末尾 6 位）。短 ID 是基于 chat_session_id 生成的，
+        /// 由调用方在拿到 chatSessionId 后用 `String(chatSessionId.suffix(6))` 自取，
+        /// 这里不再放在 struct 里（struct 自身没有 chat_session_id 字段）。
     }
 
-    private var sessions: [String: SessionInfo] = [:] // sessionId -> info
+    struct SessionInfo {
+        var path: String
+        var windowStates: [String: Bool] = [:] // windowLogPath -> isRunning（按 window 粒度的流状态，保留）
+        /// chatSessionId -> chat session 元数据与流状态
+        var chatSessions: [String: ChatSessionInfo] = [:]
+    }
+
+    private var sessions: [String: SessionInfo] = [:] // appSessionId -> info
     private var watchers: [String: FileWatcher] = [:] // windowLogPath -> watcher
     private let logsBase: String
     private var baseDirWatcher: DispatchSourceFileSystemObject?
     private var rescanTimer: Timer?
 
-    // 会话级回调（主线程）
-    var onSessionAdded: ((String) -> Void)?    // sessionId
-    var onSessionRemoved: ((String) -> Void)?  // sessionId
-    var onSessionStart: ((String) -> Void)?    // sessionId
-    var onSessionStop: ((String) -> Void)?     // sessionId
-    var onSessionActivity: ((String) -> Void)? // sessionId
+    // 应用启动级回调（主线程）—— 应用启动（Trae 一次运行）出现 / 消失
+    var onSessionAdded: ((String) -> Void)?    // appSessionId
+    var onSessionRemoved: ((String) -> Void)?  // appSessionId
+    /// chat session 级回调 —— chat session 从 idle 切到 running
+    var onChatSessionStart: ((String, String) -> Void)?  // (appSessionId, chatSessionId)
+    /// chat session 级回调 —— chat session 从 running 切到 idle（且当前仍存在）
+    var onChatSessionStop: ((String, String) -> Void)?   // (appSessionId, chatSessionId)
 
+    /// 应用启动级会话 id 列表（用于扫描/分组）
     var sessionIds: [String] { sessions.keys.sorted() }
 
-    /// 某会话各窗口的 (窗口名, 是否运行中)，用于菜单展示
-    func windowStates(for sessionId: String) -> [(name: String, running: Bool)] {
-        guard let info = sessions[sessionId] else { return [] }
-        return info.windowStates
-            .map { (name: URL(fileURLWithPath: $0.key).deletingLastPathComponent().lastPathComponent, running: $0.value) }
-            .sorted { $0.name < $1.name }
+    /// 某应用启动下所有 chat session，按"运行中优先 + 最近活跃"排序
+    func chatSessions(for appSessionId: String) -> [(id: String, info: ChatSessionInfo)] {
+        guard let info = sessions[appSessionId] else { return [] }
+        return info.chatSessions
+            .map { (id: $0.key, info: $0.value) }
+            .sorted { lhs, rhs in
+                if lhs.info.isRunning != rhs.info.isRunning { return lhs.info.isRunning }
+                return lhs.info.lastSeenAt > rhs.info.lastSeenAt
+            }
     }
 
-    /// 该会话当前是否有窗口在流式输出
-    func sessionRunning(_ sessionId: String) -> Bool {
-        guard let info = sessions[sessionId] else { return false }
-        return info.windowStates.values.contains(true)
-    }
-
-    /// 所有会话中进行中的会话个数
-    var activeSessionCount: Int {
-        sessions.values.reduce(0) { count, info in
-            info.windowStates.values.contains(true) ? count + 1 : count
+    /// 全局所有 chat session（去重，按应用启动分组；用于展示汇总或直接平铺）
+    func allChatSessions() -> [(appSessionId: String, chatId: String, info: ChatSessionInfo)] {
+        var out: [(String, String, ChatSessionInfo)] = []
+        for appId in sessionIds {
+            for (chatId, info) in sessions[appId]?.chatSessions ?? [:] {
+                out.append((appId, chatId, info))
+            }
         }
+        out.sort { lhs, rhs in
+            if lhs.2.isRunning != rhs.2.isRunning { return lhs.2.isRunning }
+            return lhs.2.lastSeenAt > rhs.2.lastSeenAt
+        }
+        return out
+    }
+
+    /// 当前所有 chat session 中处于流式输出状态的个数
+    var activeSessionCount: Int {
+        var n = 0
+        for info in sessions.values {
+            for cs in info.chatSessions.values where cs.isRunning { n += 1 }
+        }
+        return n
     }
 
     init(logsBase: String) {
@@ -281,9 +329,16 @@ class TraeLogMonitor {
         var currentState = info.windowStates[logPath] ?? false
         var toggled = false
 
+        // chat session 维度：本批新事件里出现的 chatSessionId -> (wasRunning, nowRunning)
+        var chatTransitions: [String: (wasRunning: Bool, nowRunning: Bool)] = [:]
+        // 累计本批事件中"应该被更新"的 chat session 列表（用于元数据刷新）
+        var touchedChatIds: Set<String> = []
+        let now = Date().timeIntervalSince1970
+
         content.enumerateLines { line, _ in
             guard line.contains("[chatStreamService]") || line.contains("[ai-chat/v2]") else { return }
 
+            // window 维度流状态（保留旧逻辑，作为兜底和兼容旧版 Trae）
             if self.isStartMarker(line) {
                 currentState = true
                 toggled = true
@@ -291,30 +346,153 @@ class TraeLogMonitor {
                 currentState = false
                 toggled = true
             }
+
+            // chat session 维度：元数据 + 流状态
+            if let md = self.parseChatMetadata(line: line) {
+                var cs = info.chatSessions[md.chatId] ?? ChatSessionInfo()
+                cs.lastSeenAt = now
+                if let t = md.title, !t.isEmpty { cs.title = t }
+                if let w = md.workspacePath, !w.isEmpty { cs.workspacePath = w }
+                if let c = md.createdAt { cs.createdAt = c }
+                cs.seenInWindows.insert(logPath)
+                info.chatSessions[md.chatId] = cs
+                touchedChatIds.insert(md.chatId)
+            }
+            if let ev = self.parseChatStreamEvent(line: line) {
+                var cs = info.chatSessions[ev.chatId] ?? ChatSessionInfo()
+                let wasRunning = cs.isRunning
+                cs.lastSeenAt = now
+                cs.seenInWindows.insert(logPath)
+                switch ev.kind {
+                case .start: cs.runningWindows.insert(logPath)
+                case .stop:  cs.runningWindows.remove(logPath)
+                }
+                let nowRunning = cs.isRunning
+                info.chatSessions[ev.chatId] = cs
+                if wasRunning != nowRunning {
+                    chatTransitions[ev.chatId] = (wasRunning, nowRunning)
+                }
+                touchedChatIds.insert(ev.chatId)
+            }
         }
 
         let previousState = info.windowStates[logPath] ?? false
         info.windowStates[logPath] = currentState
         sessions[sessionId] = info
 
-        if currentState && !previousState {
-            // State: idle -> running
-            DispatchQueue.main.async { [weak self] in
-                self?.onSessionStart?(sessionId)
-            }
-        } else if currentState && previousState && toggled {
-            // State: running -> running（有新一行活动，但不涉及开始/结束转换）
-            DispatchQueue.main.async { [weak self] in
-                self?.onSessionActivity?(sessionId)
-            }
-        } else if !currentState && previousState {
-            let anyRunning = info.windowStates.values.contains(true)
-            if !anyRunning {
+        // window 维度状态：作为兜底信号写入，但不再触发回调（chat session 维度已经覆盖动画触发）
+        _ = previousState
+
+        // chat session 维度回调（驱动状态条动画 + 菜单刷新）
+        for (chatId, t) in chatTransitions {
+            if t.nowRunning && !t.wasRunning {
                 DispatchQueue.main.async { [weak self] in
-                    self?.onSessionStop?(sessionId)
+                    self?.onChatSessionStart?(sessionId, chatId)
+                }
+            } else if !t.nowRunning && t.wasRunning {
+                DispatchQueue.main.async { [weak self] in
+                    self?.onChatSessionStop?(sessionId, chatId)
                 }
             }
         }
+        _ = touchedChatIds // 预留：将来想做"刚被 touch 的会话"提醒
+    }
+
+    // MARK: chat session 解析（业务层会话）
+
+    /// 解析 Session fetched / Session updated / session_updated 等事件，
+    /// 提取 chat_session_id / title / workspace_path / created_at。
+    private func parseChatMetadata(line: String) -> (chatId: String, title: String?, workspacePath: String?, createdAt: Date?)? {
+        // 仅关心 [ai-chat/v2] 行
+        guard line.contains("[ai-chat/v2]") else { return nil }
+
+        // Session fetched: ... {"chat_session_id":"...","title":"...","workspace_path":"...","created_at":"<ms>"}
+        // Session updated: ... {"chat_session_id":"...","title":"..."}（仅更新 title）
+        // event: session_updated ... "title":"..."
+        guard let chatId = extractJSONString(line: line, key: "chat_session_id") else { return nil }
+        // 兜底过滤：必须是 [a-f0-9]{20,} 形态，避免误把其他 JSON 字段当 chat id
+        guard chatId.count >= 20, chatId.allSatisfy({ $0.isHexDigit }) else { return nil }
+
+        let title = extractJSONString(line: line, key: "title")
+        let workspace = extractJSONString(line: line, key: "workspace_path")
+            ?? extractJSONString(line: line, key: "main_folder")
+            ?? extractJSONString(line: line, key: "local_folder")
+        var created: Date? = nil
+        if let ms = extractJSONString(line: line, key: "created_at"), let v = TimeInterval(ms) {
+            // Trae 的 created_at 是毫秒
+            if v > 1_000_000_000_000 { created = Date(timeIntervalSince1970: v / 1000.0) }
+            else if v > 1_000_000_000 { created = Date(timeIntervalSince1970: v) }
+        }
+        // 只有该行明确带 title/workspace/created_at 这几个字段之一，才视为元数据事件
+        guard title != nil || workspace != nil || created != nil else { return nil }
+        return (chatId, title, workspace, created)
+    }
+
+    /// chat session 维度的流事件：start / stop
+    private func parseChatStreamEvent(line: String) -> (chatId: String, kind: StreamEventKind)? {
+        guard line.contains("[ai-chat/v2]") else { return nil }
+        guard let chatId = extractJSONString(line: line, key: "sessionId")
+            ?? extractChatSessionIdFromTail(line: line)
+        else { return nil }
+        guard chatId.count >= 20, chatId.allSatisfy({ $0.isHexDigit }) else { return nil }
+
+        if isStartMarker(line) {
+            return (chatId, .start)
+        }
+        if isEndMarker(line) {
+            return (chatId, .stop)
+        }
+        return nil
+    }
+
+    private enum StreamEventKind { case start, stop }
+
+    /// 从形如 `... tailStatus: 6ab0cbed663253458ad9a836` 的尾部提取 chat session id
+    /// （[NotificationPort] Stream started, subscribing to tailStatus: <id>）
+    private func extractChatSessionIdFromTail(line: String) -> String? {
+        guard let r = line.range(of: "tailStatus: ") else { return nil }
+        let after = line[r.upperBound...]
+        let token = after.prefix { $0.isHexDigit }
+        return token.isEmpty ? nil : String(token)
+    }
+
+    /// 在日志行里非常宽松地找 `"key":"value"`：允许 value 含 \/、\" 等简单转义。
+    /// 不做严格 JSON 解析，因为渲染端日志里 JSON 经常被嵌套 / 转义不全。
+    private func extractJSONString(line: String, key: String) -> String? {
+        let needle = "\"\(key)\":\""
+        guard let r = line.range(of: needle) else { return nil }
+        var out = ""
+        let chars = Array(line)
+        // r.upperBound 是 String.Index；用 line.distance 拿 Int offset，再当 chars 的下标
+        var pos = line.distance(from: line.startIndex, to: r.upperBound)
+        while pos < chars.count {
+            let c = chars[pos]
+            if c == "\\" && pos + 1 < chars.count {
+                // 简单反转义：\" \\ \/ \n \t \uXXXX；其它原样保留
+                let next = chars[pos + 1]
+                switch next {
+                case "\"": out.append("\"")
+                case "\\": out.append("\\")
+                case "/":  out.append("/")
+                case "n":  out.append("\n")
+                case "t":  out.append("\t")
+                case "u":
+                    if pos + 5 < chars.count,
+                       let code = UInt32(String(chars[pos+2...pos+5])) {
+                        if let u = Unicode.Scalar(code) { out.append(Character(u)) }
+                        pos += 6
+                        continue
+                    }
+                default: out.append(next)
+                }
+                pos += 2
+                continue
+            }
+            if c == "\"" { return out.isEmpty ? nil : out }
+            out.append(c)
+            pos += 1
+        }
+        return nil
     }
 
     /// 流式开始标记，兼容旧版 chatStreamService 和 Trae 3.3.90 ai-chat/v2。
@@ -350,14 +528,18 @@ class TraeLogMonitor {
     /// 看门狗：把"标记为运行中但 renderer.log 文件已长时间不再写入"的窗口强制复位为空闲，
     /// 兜底一切未识别结束路径导致的卡死。活跃判定用文件本身的修改时间（任何日志写入都算），
     /// 而不是 chatStreamService 心跳行——真实进行中的对话可能长时间不写这类行，用前者可避免误杀。
+    /// 同时把该 window 从所有 chat session 的 runningWindows 里移除，让 chat session 维度同步复位。
     private func sweepStaleStreams() -> Bool {
         let now = Date()
-        var resetSessions = Set<String>()
         var changed = false
+        let liveWindowPaths = Set(watchers.keys)
 
-        for sessionId in sessions.keys {
-            guard var info = sessions[sessionId] else { continue }
+        for appSessionId in sessions.keys {
+            guard var info = sessions[appSessionId] else { continue }
             var mutated = false
+            var stopChatIds: [String] = []
+
+            // 1) window 维度 reset
             for (path, running) in info.windowStates where running {
                 let mtime = fileModificationDate(path)
                 if now.timeIntervalSince(mtime) > Config.streamStallTimeout {
@@ -366,18 +548,34 @@ class TraeLogMonitor {
                     mutated = true
                 }
             }
-            if mutated {
-                changed = true
-                sessions[sessionId] = info
-                if !info.windowStates.values.contains(true) {
-                    resetSessions.insert(sessionId)
+
+            // 2) chat session 维度：把 mtime 过期的 window 从 runningWindows 中移除
+            for (chatId, var cs) in info.chatSessions {
+                let before = cs.isRunning
+                cs.runningWindows = cs.runningWindows.filter { wPath in
+                    let m = fileModificationDate(wPath)
+                    return now.timeIntervalSince(m) <= Config.streamStallTimeout
+                }
+                // 顺便 GC 已经不存在的 window（窗口被删/未挂载）
+                let prunedSeen = cs.seenInWindows.intersection(liveWindowPaths)
+                if prunedSeen != cs.seenInWindows { cs.seenInWindows = prunedSeen }
+                let after = cs.isRunning
+                if before != after {
+                    info.chatSessions[chatId] = cs
+                    if before && !after { stopChatIds.append(chatId) }
+                    mutated = true
+                } else if cs.runningWindows.isEmpty == false || cs.seenInWindows != cs.seenInWindows {
+                    info.chatSessions[chatId] = cs
                 }
             }
-        }
 
-        for sessionId in resetSessions {
-            DispatchQueue.main.async { [weak self] in
-                self?.onSessionStop?(sessionId)
+            if mutated { sessions[appSessionId] = info; changed = true }
+
+            // 3) 回调：chat session 维度（menu 唯一关心的状态）
+            for chatId in stopChatIds {
+                DispatchQueue.main.async { [weak self] in
+                    self?.onChatSessionStop?(appSessionId, chatId)
+                }
             }
         }
         return changed
@@ -509,20 +707,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         monitor = TraeLogMonitor(logsBase: Config.logsBase)
         monitor?.onSessionAdded = { [weak self] _ in
-            self?.syncState()
+            self?.rebuildMenu()
         }
         monitor?.onSessionRemoved = { [weak self] _ in
+            self?.rebuildMenu()
+        }
+        monitor?.onChatSessionStart = { [weak self] _, _ in
             self?.syncState()
         }
-        monitor?.onSessionStart = { [weak self] _ in
-            self?.syncState()
-        }
-        monitor?.onSessionStop = { [weak self] _ in
+        monitor?.onChatSessionStop = { [weak self] _, _ in
             self?.syncState()
         }
         monitor?.start()
 
-        // 周期性刷新菜单中的窗口状态
+        // 周期性刷新菜单（chat session 的 title / workspace 可能在启动后才写出来）
         Timer.scheduledTimer(withTimeInterval: Config.rescanInterval, repeats: true) { [weak self] _ in
             self?.rebuildMenu()
         }
@@ -574,32 +772,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = text
     }
 
-    /// 重建菜单：聚合标题 + 每个会话的状态（含其窗口列表子菜单）
+    /// 重建菜单：聚合标题 + 每个 chat session（业务层对话）的状态。
+    /// 平铺，不再嵌套 window 子菜单。每个 item 展示：
+    ///   <状态>  <工作区短名> · <标题>   [HH:MM 创建时间]
+    /// 名字缺失时降级：title → workspace basename → 短 ID。
     private func rebuildMenu() {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
 
         let title = activeCount > 0 ? "Trae: \(activeCount) 个会话进行中" : "Trae: 空闲"
-        let titleItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        menu.addItem(titleItem)
+        menu.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
 
-        let ids = monitor?.sessionIds ?? []
-        if ids.isEmpty {
+        let all = monitor?.allChatSessions() ?? []
+        if all.isEmpty {
             menu.addItem(NSMenuItem(title: "（暂无存活会话）", action: nil, keyEquivalent: ""))
         } else {
-            for sessionId in ids {
-                let running = monitor?.sessionRunning(sessionId) ?? false
-                let windows = monitor?.windowStates(for: sessionId) ?? []
-                let item = NSMenuItem(title: "会话 \(sessionId) — \(running ? "运行中" : "空闲")",
-                                      action: nil, keyEquivalent: "")
-                let sub = NSMenu()
-                for w in windows.isEmpty ? [(name: "（无窗口）", running: false)] : windows {
-                    sub.addItem(NSMenuItem(title: "\(w.name): \(w.running ? "运行中" : "空闲")",
-                                           action: nil, keyEquivalent: ""))
+            // 按 appSessionId 分组显示（保留 Trae 应用启动作为分组 header），不再展开 window submenu
+            var currentAppId: String? = nil
+            let df = DateFormatter()
+            df.dateFormat = "HH:mm"
+            for entry in all {
+                if entry.appSessionId != currentAppId {
+                    currentAppId = entry.appSessionId
+                    let header = NSMenuItem(title: formatAppSessionLabel(entry.appSessionId),
+                                             action: nil, keyEquivalent: "")
+                    header.isEnabled = false
+                    menu.addItem(header)
                 }
-                item.submenu = sub
-                menu.addItem(item)
+                let line = formatChatSessionLine(chatId: entry.chatId, info: entry.info, df: df)
+                menu.addItem(NSMenuItem(title: line, action: nil, keyEquivalent: ""))
             }
         }
 
@@ -607,6 +809,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let quit = NSMenuItem(title: "Quit trae-status-bar", action: #selector(quitAll), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+    }
+
+    /// 应用启动目录名（如 20260920T121608） → "Trae · 2026-09-20 12:16:08"
+    private func formatAppSessionLabel(_ appId: String) -> String {
+        guard appId.count >= 15,
+              appId.hasPrefix("20") else { return "Trae · \(appId)" }
+        // 20260920T121608
+        let yyyy = String(appId.prefix(4))
+        let mm = String(appId.dropFirst(4).prefix(2))
+        let dd = String(appId.dropFirst(6).prefix(2))
+        let HH = String(appId.dropFirst(9).prefix(2))
+        let MM = String(appId.dropFirst(11).prefix(2))
+        let SS = String(appId.dropFirst(13).prefix(2))
+        return "Trae · \(yyyy)-\(mm)-\(dd) \(HH):\(MM):\(SS)"
+    }
+
+    /// 单个 chat session 菜单行：
+    ///   ▶  mp-dialer · 使用 grill-me master_huawei_kms    [14:17]
+    ///   ○  Master Refactor Predict Call Branch            [14:18]
+    private func formatChatSessionLine(chatId: String, info: TraeLogMonitor.ChatSessionInfo, df: DateFormatter) -> String {
+        let marker = info.isRunning ? "▶" : "○"
+        let workspace = info.workspaceShort ?? ""
+        let display = info.displayName
+        let shortId = String(chatId.suffix(6))
+        let time: String
+        if let d = info.createdAt {
+            time = df.string(from: d)
+        } else {
+            time = "·" + shortId
+        }
+        let name: String
+        if !workspace.isEmpty && workspace != display {
+            name = "\(workspace) · \(display)"
+        } else if !workspace.isEmpty {
+            name = workspace
+        } else if !info.title.isEmpty {
+            name = display
+        } else {
+            name = "会话 ·" + shortId
+        }
+        return "\(marker)  \(name)  [\(time)]"
     }
 
     @objc func quitAll() {
