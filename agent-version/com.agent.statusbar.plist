@@ -3,18 +3,18 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.qoder.statusbar</string>
+    <string>com.agent.statusbar</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/wav/tmpwork/agent-status-bar/qoder-version/qoder-status-bar</string>
+        <string>/Users/wav/tmpwork/agent-status-bar/agent-version/agent-status-bar</string>
     </array>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/qoder-status-bar.stdout</string>
+    <string>/tmp/agent-status-bar.stdout</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/qoder-status-bar.stderr</string>
+    <string>/tmp/agent-status-bar.stderr</string>
 </dict>
 </plist>

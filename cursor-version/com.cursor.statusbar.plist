@@ -6,7 +6,7 @@
     <string>com.cursor.statusbar</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/wav/tmpwork/trae-status-bar/cursor-version/cursor-status-bar</string>
+        <string>/Users/wav/tmpwork/agent-status-bar/cursor-version/cursor-status-bar</string>
     </array>
     <key>KeepAlive</key>
     <true/>

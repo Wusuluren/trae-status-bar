@@ -6,7 +6,7 @@
     <string>com.trae.statusbar</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/wav/tmpwork/trae-status-bar/trae-version/trae-status-bar</string>
+        <string>/Users/wav/tmpwork/agent-status-bar/trae-version/trae-status-bar</string>
     </array>
     <key>KeepAlive</key>
     <true/>
