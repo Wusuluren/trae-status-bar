@@ -5,9 +5,10 @@ import Foundation
 /// 与 Trae / Qoder 的差异（均基于本机真实 `windowN/renderer.log` 逆向得到）：
 /// - 每个窗口的 AI 日志仍是 `windowN/renderer.log`（与 Trae 同名；Qoder 是 `agent.log`）
 /// - 会话 id（composerId）是 UUID
-/// - 流开始：`[ComposerWakelockManager] Acquired wakelock ... reason="agent-loop" composerId=<uuid>`
-/// - 流结束：`[ComposerWakelockManager] Released wakelock ... reason="..." composerId=<uuid>`
-///   （常见 reason=`generation-ended`；任意 Released 都视为结束，避免 abort/error 漏清）
+/// - 流开始：`[ComposerWakelockManager] Acquired wakelock ... reason="agent-loop"|"agent-loop-resumed" composerId=<uuid>`
+/// - 流结束：`[ComposerWakelockManager] Released wakelock ... reason="generation-ended" composerId=<uuid>`
+///   （`reason="user-approval-requested"` 的释放是等待授权、会话未结束，忽略以保持转圈；
+///    其余 Released 视为结束，避免 abort/error 漏清）
 /// - 标题 / 工作区：renderer.log 里通常不写业务标题；展示层回退到 workspace basename 或短 id
 /// - 日志根目录：`~/Library/Application Support/Cursor/logs`
 /// - 窗口目录：`window1`、`window2_wb0`（Agents 窗）等，前缀均为 `window`
@@ -56,9 +57,14 @@ struct CursorLogSource: LogSource {
         guard line.contains("[ComposerWakelockManager]") else { return nil }
 
         let kind: StreamEventKind
-        if line.contains("Acquired wakelock"), line.contains("reason=\"agent-loop\"") {
+        if line.contains("Acquired wakelock"),
+           line.contains("reason=\"agent-loop\"") || line.contains("reason=\"agent-loop-resumed\"") {
+            // agent-loop（首次开始）/ agent-loop-resumed（授权后恢复）都视为运行中
             kind = .start
         } else if line.contains("Released wakelock") {
+            // 等待用户授权时 wakelock 会以 user-approval-requested 释放，但会话并未结束：
+            // 忽略该释放，保持转圈，直到授权后 agent-loop-resumed 重新获取。
+            if line.contains("reason=\"user-approval-requested\"") { return nil }
             // generation-ended / abort / 其它释放路径一律 stop
             kind = .stop
         } else {
