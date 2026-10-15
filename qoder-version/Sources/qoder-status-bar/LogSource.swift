@@ -41,6 +41,10 @@ protocol LogSource {
     func extractMetadata(from line: String) -> SessionMetadata?
     /// 提取流开始/结束事件，无则返回 nil
     func extractStreamEvent(from line: String) -> StreamEvent?
+    /// 提取日志行前缀时间戳，无则返回 nil。
+    /// 默认实现兼容 `2026-10-12 17:03:34.938` 与 ISO `2026-10-15T10:15:05.026+08:00` 两种前缀，
+    /// 供上层"会话闲置过期"判定使用；来源可覆写。
+    func extractTimestamp(from line: String) -> Date?
 }
 
 // MARK: - 共享解析工具
@@ -115,4 +119,28 @@ extension LogSource {
         }
         return s
     }
+
+    /// 解析日志行开头的 `yyyy-MM-dd[T| ]HH:mm:ss`。丢弃毫秒与时区：日志与状态栏同机同时区，
+    /// 闲置过期以小时为粒度，误差可忽略。解析失败返回 nil，调用方按需回退挂钟时间。
+    func extractTimestamp(from line: String) -> Date? {
+        let nsRange = NSRange(line.startIndex..., in: line)
+        guard let m = lineTimestampRegex.firstMatch(in: line, range: nsRange),
+              let r = Range(m.range, in: line) else { return nil }
+        var s = String(line[r]).replacingOccurrences(of: "T", with: " ")
+        if s.count > 19 { s = String(s.prefix(19)) }
+        return lineTimestampFormatter.date(from: s)
+    }
 }
+
+// MARK: - 时间戳解析共享资源
+/// 文件级常量：protocol extension 不能持有存储属性，故放此处，方法内引用。
+private let lineTimestampRegex = try! NSRegularExpression(
+    pattern: #"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"#)
+private let lineTimestampFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.calendar = Calendar(identifier: .gregorian)
+    f.timeZone = .current
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return f
+}()

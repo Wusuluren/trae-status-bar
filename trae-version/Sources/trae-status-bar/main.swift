@@ -338,6 +338,9 @@ class TraeLogMonitor {
         content.enumerateLines { line, _ in
             guard line.contains("[chatStreamService]") || line.contains("[ai-chat/v2]") else { return }
 
+            // 优先用日志行自带时间戳作为"最后活跃时间"，使闲置过期反映真实活跃度；无时间戳才回退挂钟。
+            let eventTime = self.lineTimestamp(from: line) ?? now
+
             // window 维度流状态（保留旧逻辑，作为兜底和兼容旧版 Trae）
             if self.isStartMarker(line) {
                 currentState = true
@@ -350,7 +353,7 @@ class TraeLogMonitor {
             // chat session 维度：元数据 + 流状态
             if let md = self.parseChatMetadata(line: line) {
                 var cs = info.chatSessions[md.chatId] ?? ChatSessionInfo()
-                cs.lastSeenAt = now
+                cs.lastSeenAt = max(cs.lastSeenAt, eventTime)
                 if let t = md.title, !t.isEmpty { cs.title = t }
                 if let w = md.workspacePath, !w.isEmpty { cs.workspacePath = w }
                 if let c = md.createdAt { cs.createdAt = c }
@@ -361,7 +364,7 @@ class TraeLogMonitor {
             if let ev = self.parseChatStreamEvent(line: line) {
                 var cs = info.chatSessions[ev.chatId] ?? ChatSessionInfo()
                 let wasRunning = cs.isRunning
-                cs.lastSeenAt = now
+                cs.lastSeenAt = max(cs.lastSeenAt, eventTime)
                 cs.seenInWindows.insert(logPath)
                 switch ev.kind {
                 case .start: cs.runningWindows.insert(logPath)
@@ -531,6 +534,7 @@ class TraeLogMonitor {
     /// 同时把该 window 从所有 chat session 的 runningWindows 里移除，让 chat session 维度同步复位。
     private func sweepStaleStreams() -> Bool {
         let now = Date()
+        let nowTS = now.timeIntervalSince1970
         var changed = false
         let liveWindowPaths = Set(watchers.keys)
 
@@ -538,6 +542,7 @@ class TraeLogMonitor {
             guard var info = sessions[appSessionId] else { continue }
             var mutated = false
             var stopChatIds: [String] = []
+            var expiredChatIds: [String] = []
 
             // 1) window 维度 reset
             for (path, running) in info.windowStates where running {
@@ -551,6 +556,13 @@ class TraeLogMonitor {
 
             // 2) chat session 维度：把 mtime 过期的 window 从 runningWindows 中移除
             for (chatId, var cs) in info.chatSessions {
+                // 对话级闲置过期：静默超过 sessionStaleThreshold 即从列表回收（含卡在 running 的历史会话）。
+                if nowTS - cs.lastSeenAt > Config.sessionStaleThreshold {
+                    if cs.isRunning { stopChatIds.append(chatId) }
+                    expiredChatIds.append(chatId)
+                    mutated = true
+                    continue
+                }
                 let before = cs.isRunning
                 cs.runningWindows = cs.runningWindows.filter { wPath in
                     let m = fileModificationDate(wPath)
@@ -567,6 +579,12 @@ class TraeLogMonitor {
                 } else if cs.runningWindows.isEmpty == false || cs.seenInWindows != cs.seenInWindows {
                     info.chatSessions[chatId] = cs
                 }
+            }
+
+            // 结构删除放在遍历之后，避免边迭代边改变字典。
+            for chatId in expiredChatIds {
+                info.chatSessions.removeValue(forKey: chatId)
+                print("[trae-status-bar] Chat session expired: \(chatId)")
             }
 
             if mutated { sessions[appSessionId] = info; changed = true }
@@ -589,6 +607,28 @@ class TraeLogMonitor {
         }
         return d
     }
+
+    /// 解析日志行开头的 `yyyy-MM-dd[T| ]HH:mm:ss`（Trae 为 `2026-10-15T10:15:05.026+08:00`）。
+    /// 丢弃毫秒与时区（同机同时区，闲置过期以小时为粒度，误差可忽略）；解析失败返回 nil。
+    private func lineTimestamp(from line: String) -> TimeInterval? {
+        let ns = NSRange(line.startIndex..., in: line)
+        guard let m = Self.lineTsRegex.firstMatch(in: line, range: ns),
+              let r = Range(m.range, in: line) else { return nil }
+        var s = String(line[r]).replacingOccurrences(of: "T", with: " ")
+        if s.count > 19 { s = String(s.prefix(19)) }
+        return Self.lineTsFormatter.date(from: s)?.timeIntervalSince1970
+    }
+
+    private static let lineTsRegex = try! NSRegularExpression(
+        pattern: #"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"#)
+    private static let lineTsFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
 
     // MARK: 存活判定
 

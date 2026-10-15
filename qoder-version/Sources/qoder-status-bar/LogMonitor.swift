@@ -203,9 +203,14 @@ final class LogMonitor {
         content.enumerateLines { line, _ in
             guard self.source.interestedIn(line) else { return }
 
+            // 优先用日志行自带时间戳作为"最后活跃时间"：readAll 全量回放历史日志时，
+            // 若统一用挂钟 now 会把几天前的旧对话标成刚刚活跃，导致永不 idle。
+            // 无时间戳（解析失败）才回退挂钟。
+            let eventTime = self.source.extractTimestamp(from: line)?.timeIntervalSince1970 ?? now
+
             if let md = self.source.extractMetadata(from: line), let chatId = md.chatId {
                 var cs = info.chatSessions[chatId] ?? ChatSessionInfo()
-                cs.lastSeenAt = now
+                cs.lastSeenAt = max(cs.lastSeenAt, eventTime)
                 if let t = md.title, !t.isEmpty { cs.title = t }
                 if let w = md.workspacePath, !w.isEmpty { cs.workspacePath = w }
                 if let c = md.createdAt { cs.createdAt = c }
@@ -216,7 +221,7 @@ final class LogMonitor {
             if let ev = self.source.extractStreamEvent(from: line) {
                 var cs = info.chatSessions[ev.chatId] ?? ChatSessionInfo()
                 let wasRunning = cs.isRunning
-                cs.lastSeenAt = now
+                cs.lastSeenAt = max(cs.lastSeenAt, eventTime)
                 cs.seenInWindows.insert(logPath)
                 switch ev.kind {
                 case .start: cs.runningWindows.insert(logPath)
@@ -245,6 +250,7 @@ final class LogMonitor {
 
     private func sweepStaleStreams() -> Bool {
         let now = Date()
+        let nowTS = now.timeIntervalSince1970
         var changed = false
         let liveWindowPaths = Set(watchers.keys)
 
@@ -252,8 +258,17 @@ final class LogMonitor {
             guard var info = sessions[sessionPath] else { continue }
             var mutated = false
             var stopChatIds: [String] = []
+            var expiredChatIds: [String] = []
 
             for (chatId, var cs) in info.chatSessions {
+                // 对话级闲置过期：lastSeenAt 已来自日志行真实时间，静默超过 sessionStaleThreshold
+                // 即从列表回收。历史回放的多日旧对话（含因缺 stop 而卡在 running 的）在此被清除。
+                if nowTS - cs.lastSeenAt > Config.sessionStaleThreshold {
+                    if cs.isRunning { stopChatIds.append(chatId) }
+                    expiredChatIds.append(chatId)
+                    mutated = true
+                    continue
+                }
                 let before = cs.isRunning
                 cs.runningWindows = cs.runningWindows.filter { wPath in
                     now.timeIntervalSince(fileModificationDate(wPath)) <= Config.streamStallTimeout
@@ -268,6 +283,12 @@ final class LogMonitor {
                 } else if !cs.runningWindows.isEmpty || prunedSeen != cs.seenInWindows {
                     info.chatSessions[chatId] = cs
                 }
+            }
+
+            // 结构删除放在遍历之后，避免边迭代边改变字典。
+            for chatId in expiredChatIds {
+                info.chatSessions.removeValue(forKey: chatId)
+                print("[qoder-status-bar] Chat session expired: \(chatId)")
             }
 
             if mutated { sessions[sessionPath] = info; changed = true }
