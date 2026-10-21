@@ -10,8 +10,11 @@ import Foundation
 ///   （`reason="user-approval-requested"` 的释放是等待授权、会话未结束，忽略以保持转圈；
 ///    其余 Released 视为结束，避免 abort/error 漏清）
 /// - 标题 / 工作区：renderer.log 里通常不写业务标题；展示层回退到 workspace basename 或短 id
-/// - 日志根目录：`~/Library/Application Support/Cursor/logs`
-/// - 窗口目录：`window1`、`window2_wb0`（Agents 窗）等，前缀均为 `window`
+/// - 日志根目录：`~/Library/Application Support/Cursor/logs`；
+///   Private Inference 版是独立 app（`/Applications/Cursor Private Inference.app`），
+///   数据目录同样独立：`~/Library/Application Support/Cursor Private Inference/logs`
+/// - 窗口目录：`window1`、`window2_wb0`（Agents 窗）等，前缀均为 `window`；
+///   Private Inference 版还会出现 `window1_wb0` / `window1_wb1` 子窗口
 struct CursorLogSource: LogSource {
     let displayName = "Cursor"
     let windowDirPrefix = "window"
@@ -24,6 +27,8 @@ struct CursorLogSource: LogSource {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return [
             "\(home)/Library/Application Support/Cursor/logs",
+            // Private Inference 版独立 bundle、独立数据目录；renderer.log 格式与普通版一致
+            "\(home)/Library/Application Support/Cursor Private Inference/logs",
         ]
     }()
 

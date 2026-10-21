@@ -15,7 +15,7 @@ macOS 菜单栏状态指示器（Trae / Qoder 版的 Cursor IDE 移植）：监�
 | 流结束 | `Stream finalized / stopped` | `-> completed` / `-> cancelled` | `[ComposerWakelockManager] Released wakelock ...`（任意 reason） |
 | 标题 | `Session updated {title}` | `Updated tab title for session` | 查 `User/globalStorage/conversation-search.db` 的 `conversations(id, title)`，id 即 composerId |
 | 工作区 | `workspace_path` JSON | `[Terminal] ... cwd=` | renderer.log 通常不写；菜单回退到短 id |
-| 日志根目录 | `~/Library/Application Support/Trae CN/logs` | `Qoder/logs` 与 `QoderCN/logs` | `~/Library/Application Support/Cursor/logs` |
+| 日志根目录 | `~/Library/Application Support/Trae CN/logs` | `Qoder/logs` 与 `QoderCN/logs` | `Cursor/logs` 与 `Cursor Private Inference/logs` |
 
 关键实现说明：
 - `Disabled/Restored background throttling` 是 wakelock 伴生事件，**不**触发状态切换。
@@ -23,10 +23,14 @@ macOS 菜单栏状态指示器（Trae / Qoder 版的 Cursor IDE 移植）：监�
   看门狗在日志长时间无写入时强制复位。
 - Cursor 进程未必带 `--aha-log-session-time=`；进程探测落空时自动回退 mtime 存活启发式。
 - 窗口目录含 `window1`、`window2_wb0`（Agents 窗）等，统一按 `window` 前缀匹配。
+- **Private Inference 版**：`/Applications/Cursor Private Inference.app` 是独立 app，
+  日志根目录为 `~/Library/Application Support/Cursor Private Inference/logs`，
+  `renderer.log` 事件格式与普通版一致；两处根目录同时监听，各自存在的才挂载。
 - **会话名**：`renderer.log` 只写 `composerId`，不带标题；标题来自 Cursor 的
   ConversationSearch 进程写入的全局 sqlite 库
   `~/Library/Application Support/Cursor/User/globalStorage/conversation-search.db`
-  （表 `conversations`，字段 `id` + `title`）。`ConversationTitleResolver.swift`
+  （表 `conversations`，字段 `id` + `title`）；Private Inference 版对应的库在其独立数据目录下，
+  两组路径都在候选列表内。`ConversationTitleResolver.swift`
   直接声明 C 符号并链接 `-lsqlite3` 做只读查询（本机 `/usr/local/include` 的
   sqlite3 头与 SDK 头不兼容，故不走 `import SQLite3`），按 id 缓存，未索引则回退短 id。
 - 菜单行展示：`▶/○  <会话名或短id>  [HH:MM]`。

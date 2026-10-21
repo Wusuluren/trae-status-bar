@@ -37,39 +37,59 @@ private func sqlite3_finalize(_ stmt: OpaquePointer?) -> Int32
 
 /// composerId -> 会话标题。renderer.log 只记 composerId，人类可读标题由 Cursor 的
 /// ConversationSearch 写进全局 `conversation-search.db` 的 `conversations(id, title)`。
-/// 只读查询；库缺失/未索引时返回 nil，展示层回退短 id。
+/// 普通版与 Private Inference 版使用各自独立的数据目录，各有一个索引库，逐个尝试只读打开。
+/// 只读查询；所有库都缺失/未索引时返回 nil，展示层回退短 id。
 final class ConversationTitleResolver {
-    private let dbPath: String
-    private var db: OpaquePointer?
+    private var dbs: [OpaquePointer] = []
     private var cache: [String: String] = [:]
 
     private static let cacheLimit = 2000
 
-    init?(defaultPath: String? = NSSearchPathForDirectoriesInDomains(.applicationSupportDirectory, .userDomainMask, true)
-        .first.map { "\($0)/Cursor/User/globalStorage/conversation-search.db" }) {
-        guard let path = defaultPath, !path.isEmpty else { return nil }
-        self.dbPath = path
-        guard openDB() else { return nil }
+    /// 候选索引库路径：普通 Cursor 在前，Private Inference 版在后。
+    private static var defaultPaths: [String] {
+        let support = NSSearchPathForDirectoriesInDomains(
+            .applicationSupportDirectory, .userDomainMask, true).first
+        guard let support else { return [] }
+        return [
+            "\(support)/Cursor/User/globalStorage/conversation-search.db",
+            "\(support)/Cursor Private Inference/User/globalStorage/conversation-search.db",
+        ]
     }
 
-    private func openDB() -> Bool {
+    init?(paths: [String]? = nil) {
+        for path in paths ?? Self.defaultPaths where !path.isEmpty {
+            if let db = Self.openDB(at: path) { dbs.append(db) }
+        }
+        guard !dbs.isEmpty else { return nil }
+    }
+
+    private static func openDB(at path: String) -> OpaquePointer? {
         var handle: OpaquePointer?
-        let result = dbPath.withCString { ptr in
+        let result = path.withCString { ptr in
             sqlite3_open_v2(ptr, &handle, Int32(SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTATE), nil)
         }
         guard result == SQLITE_OK, let h = handle else {
             if let handle { sqlite3_close(handle) }
-            return false
+            return nil
         }
-        db = h
-        return true
+        return h
     }
 
     /// 查不到返回 nil（未索引 / 空标题 / 库被重建）。结果按 id 缓存，避免每次刷新菜单都打库。
     func title(for composerId: String) -> String? {
         if let cached = cache[composerId] { return cached }
-        guard let db else { return nil }
+        for db in dbs {
+            guard let title = Self.query(db, composerId: composerId) else { continue }
+            if cache.count >= Self.cacheLimit { cache.removeAll(keepingCapacity: true) }
+            cache[composerId] = title
+            print("[agent-status-bar] Resolved title: \(composerId.prefix(8)) -> \(title)")
+            return title
+        }
+        return nil
+    }
 
+    /// 单个库内查询；同一 composerId 只会落在一个库里，命中即返回。
+    private static func query(_ db: OpaquePointer, composerId: String) -> String? {
         let sql = "SELECT title FROM conversations WHERE id = ? LIMIT 1"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
@@ -83,16 +103,11 @@ final class ConversationTitleResolver {
         guard let text = sqlite3_column_text(stmt, 0) else { return nil }
         let title = String(cString: text)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { return nil }
-
-        if cache.count >= Self.cacheLimit { cache.removeAll(keepingCapacity: true) }
-        cache[composerId] = title
-        print("[agent-status-bar] Resolved title: \(composerId.prefix(8)) -> \(title)")
-        return title
+        return title.isEmpty ? nil : title
     }
 
     deinit {
-        if let db { sqlite3_close(db) }
+        for db in dbs { sqlite3_close(db) }
     }
 }
 

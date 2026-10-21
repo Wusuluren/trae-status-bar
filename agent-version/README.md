@@ -32,6 +32,7 @@ macOS 菜单栏状态指示器：**Trae / Qoder / Cursor 三个 IDE 版本的功
 3. **标题外部解析改为按来源声明**：`ChatTitleResolving` 协议 +
    `LogMonitor.resolveMissingTitles()` 动态检测，只有 Cursor 来源接
    `conversation-search.db`（sqlite 只读查询，`-lsqlite3`），Trae / Qoder 走日志行内标题。
+   Private Inference 版是独立 app、独立数据目录，其索引库同样在候选列表内。
 
 ## 与三个独立版本的差异对照
 
@@ -42,7 +43,7 @@ macOS 菜单栏状态指示器：**Trae / Qoder / Cursor 三个 IDE 版本的功
 | 流开始 | `[ai-chat/v2] Stream started` 等 | `ACP Stream Started` / `-> streaming` | `Acquired wakelock reason="agent-loop"` | 按来源各自解析 |
 | 流结束 | `Stream finalized / stopped` 等 | `-> completed / cancelled`（`suspended` 不算） | `Released wakelock`（任意 reason） | 同上 |
 | 标题 | `Session updated {title}` | `Updated tab title for session` | 查 conversation-search.db | 同上（外部解析仅 Cursor） |
-| 日志根目录 | `Trae CN/logs`（回退 `Trae/logs`） | `Qoder/logs` 与 `QoderCN/logs` | `Cursor/logs` | 全部监听 |
+| 日志根目录 | `Trae CN/logs`（回退 `Trae/logs`） | `Qoder/logs` 与 `QoderCN/logs` | `Cursor/logs` 与 `Cursor Private Inference/logs` | 全部监听 |
 
 ## 目录结构
 
